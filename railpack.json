@@ -1,8 +1,0 @@
-{
-  "build": {
-    "type": "python"
-  },
-  "run": {
-    "command": "python bot.py"
-  }
-}
