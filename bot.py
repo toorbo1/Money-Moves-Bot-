@@ -1,5 +1,5 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, WebAppInfo
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from sqlalchemy import create_engine, Column, Integer, String, Text, Float, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -8,6 +8,7 @@ import json
 import os
 from typing import Dict, List
 from datetime import datetime
+import requests
 
 # Настройка логирования
 logging.basicConfig(
@@ -58,11 +59,113 @@ class Referral(Base):
     created_at = Column(DateTime, default=datetime.now)
     first_task_completed = Column(Boolean, default=False)
 
-# Конфигурация
-BOT_TOKEN = "7803868173:AAF7MrQCePuVzxJyOdm9DzzFnL3817S2100"
-ADMIN_IDS = [8358009538]  # Главные администраторы
-REFERRAL_BONUS = 10.0  # Бонус приглашенному
-REFERRER_BONUS_PERCENT = 0.1  # 10% от первого заработка приглашенного
+class SubGramManager:
+    def __init__(self, secret_key: str):
+        self.secret_key = secret_key
+        self.base_url = "https://api.subgram.org"
+        self.headers = {
+            "Auth": secret_key,
+            "Content-Type": "application/json"
+        }
+    
+    def add_bot(self, bot_token: str, max_sponsors: int = 4, time_purge: int = 180, 
+                text_op: str = None, forbidden_themes: List[str] = None) -> Dict:
+        """Добавляет бота в SubGram систему"""
+        data = {
+            "action": "add",
+            "bot_token": bot_token,
+            "max_sponsors": max_sponsors,
+            "time_purge": time_purge,
+            "get_links": 0,
+            "show_quiz": 1,
+            "gender_question": 1,
+            "age_question": 0
+        }
+        
+        if text_op:
+            data["text_op"] = text_op
+        
+        if forbidden_themes:
+            data["forbidden_themes"] = forbidden_themes
+        
+        response = requests.post(f"{self.base_url}/bots", headers=self.headers, json=data)
+        return response.json()
+    
+    def update_bot(self, bot_id: int, is_on: int = None, **kwargs) -> Dict:
+        """Обновляет настройки бота в SubGram"""
+        data = {
+            "action": "update",
+            "bot_id": bot_id
+        }
+        
+        if is_on is not None:
+            data["is_on"] = is_on
+        
+        for key, value in kwargs.items():
+            data[key] = value
+        
+        response = requests.post(f"{self.base_url}/bots", headers=self.headers, json=data)
+        return response.json()
+    
+    def get_bot_info(self, bot_id: int) -> Dict:
+        """Получает информацию о боте"""
+        data = {
+            "action": "info",
+            "bot_id": bot_id
+        }
+        
+        response = requests.post(f"{self.base_url}/bots", headers=self.headers, json=data)
+        return response.json()
+    
+    def get_sponsors(self, api_key: str, user_id: int, chat_id: int, first_name: str = None, 
+                    username: str = None, language_code: str = None, is_premium: bool = None,
+                    action: str = "subscribe", gender: str = None, age: int = None,
+                    max_sponsors: int = None, exclude_resource_ids: List[str] = None) -> Dict:
+        """Получает список спонсоров для пользователя"""
+        headers = self.headers.copy()
+        headers["Auth"] = api_key
+        
+        data = {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "action": action
+        }
+        
+        # Добавляем опциональные параметры
+        if first_name:
+            data["first_name"] = first_name
+        if username:
+            data["username"] = username
+        if language_code:
+            data["language_code"] = language_code
+        if is_premium is not None:
+            data["is_premium"] = is_premium
+        if gender:
+            data["gender"] = gender
+        if age:
+            data["age"] = age
+        if max_sponsors:
+            data["max_sponsors"] = max_sponsors
+        if exclude_resource_ids:
+            data["exclude_resource_ids"] = exclude_resource_ids
+        
+        response = requests.post(f"{self.base_url}/get-sponsors", headers=headers, json=data)
+        return response.json()
+    
+    def check_user_subscriptions(self, api_key: str, user_id: int, links: List[str] = None) -> Dict:
+        """Проверяет подписки пользователя"""
+        headers = self.headers.copy()
+        headers["Auth"] = api_key
+        
+        data = {
+            "user_id": user_id
+        }
+        
+        if links:
+            data["links"] = links
+        
+        response = requests.post(f"{self.base_url}/get-user-subscriptions", headers=headers, json=data)
+        return response.json()
 
 class BotManager:
     def __init__(self):
@@ -99,7 +202,7 @@ class BotManager:
 
     def remove_admin(self, user_id: int):
         if user_id in ADMIN_IDS:
-            return False  # Нельзя удалить главного администратора
+            return False
         admin = self.session.query(Admin).filter(Admin.user_id == user_id).first()
         if admin:
             self.session.delete(admin)
@@ -142,7 +245,6 @@ class BotManager:
         if balance:
             return balance.balance
         else:
-            # Создаем запись баланса, если её нет
             new_balance = UserBalance(user_id=user_id, balance=0.0)
             self.session.add(new_balance)
             self.session.commit()
@@ -191,7 +293,6 @@ class BotManager:
         ).first()
         if task and not task.approved:
             task.approved = True
-            # Начисляем деньги за задание
             button = self.get_button(button_id)
             if button and button.price > 0:
                 self.update_user_balance(user_id, button.price)
@@ -200,7 +301,6 @@ class BotManager:
         return False
 
     def add_referral(self, referrer_id: int, referred_id: int):
-        # Проверяем, нет ли уже такой записи
         existing = self.session.query(Referral).filter(
             Referral.referred_id == referred_id
         ).first()
@@ -228,25 +328,61 @@ class BotManager:
         return False
 
     def get_all_users(self):
-        """Получить всех пользователей, у которых есть баланс"""
         users = self.session.query(UserBalance).all()
         return [user.user_id for user in users]
 
-# Инициализация менеджера
+    def get_user_subgram_data(self, user_id: int):
+        """Получает данные пользователя для SubGram"""
+        user_data = self.session.query(UserSubGramData).filter(UserSubGramData.user_id == user_id).first()
+        return user_data
+
+    def update_user_subgram_data(self, user_id: int, gender: str = None, age: int = None):
+        """Обновляет данные пользователя для SubGram"""
+        user_data = self.session.query(UserSubGramData).filter(UserSubGramData.user_id == user_id).first()
+        if not user_data:
+            user_data = UserSubGramData(user_id=user_id, gender=gender, age=age)
+            self.session.add(user_data)
+        else:
+            if gender:
+                user_data.gender = gender
+            if age:
+                user_data.age = age
+        self.session.commit()
+        return user_data
+
+# Добавим модель для хранения данных SubGram пользователя
+class UserSubGramData(Base):
+    __tablename__ = 'user_subgram_data'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    gender = Column(String(10))  # male, female
+    age = Column(Integer)
+    updated_at = Column(DateTime, default=datetime.now)
+
+# Конфигурация
+BOT_TOKEN = "7803868173:AAF7MrQCePuVzxJyOdm9DzzFnL3817S2100"
+ADMIN_IDS = [8358009538]
+REFERRAL_BONUS = 10.0
+REFERRER_BONUS_PERCENT = 0.1
+
+# SubGram настройки
+SUBGRAM_SECRET_KEY = "f1dc509d4996cb3fcf7a5c1ba28dffdb69d6d1a5f275d79cd639ff57a4a70395"
+SUBGRAM_BOT_API_KEY = None  # Будет установлен автоматически
+
+# Инициализация менеджеров
 bot_manager = BotManager()
+subgram_manager = SubGramManager(SUBGRAM_SECRET_KEY)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    user = update.effective_user
     
     # Обработка реферальной ссылки
     if context.args:
         try:
             referrer_id = int(context.args[0])
             if bot_manager.add_referral(referrer_id, user_id):
-                # Начисляем бонус приглашенному
                 bot_manager.update_user_balance(user_id, REFERRAL_BONUS)
-                
-                # Уведомляем пригласившего
                 try:
                     await context.bot.send_message(
                         chat_id=referrer_id,
@@ -256,6 +392,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error notifying referrer: {e}")
         except ValueError:
             pass
+    
+    # Проверяем подписки через SubGram
+    if SUBGRAM_BOT_API_KEY:
+        subgram_result = await check_subgram_subscriptions(update, context, user)
+        if subgram_result == "blocked":
+            return  # Пользователь не прошел проверку
     
     if bot_manager.is_admin(user_id):
         keyboard = [
@@ -270,8 +412,161 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await show_main_menu(update, context)
 
+async def check_subgram_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+    """Проверяет подписки пользователя через SubGram"""
+    try:
+        user_id = user.id
+        chat_id = update.effective_chat.id
+        
+        # Получаем данные пользователя для SubGram
+        user_data = bot_manager.get_user_subgram_data(user_id)
+        
+        result = subgram_manager.get_sponsors(
+            api_key=SUBGRAM_BOT_API_KEY,
+            user_id=user_id,
+            chat_id=chat_id,
+            first_name=user.first_name,
+            username=user.username,
+            language_code=user.language_code,
+            is_premium=user.is_premium,
+            gender=user_data.gender if user_data else None,
+            age=user_data.age if user_data else None
+        )
+        
+        logger.info(f"SubGram response: {result}")
+        
+        if result.get("status") == "ok":
+            # Пользователь прошел проверку
+            return "passed"
+        
+        elif result.get("status") == "warning":
+            # Нужно подписаться на каналы
+            await show_subgram_sponsors(update, context, result)
+            return "blocked"
+        
+        elif result.get("status") == "register":
+            # Нужно заполнить анкету
+            await show_subgram_registration(update, context, result)
+            return "blocked"
+        
+        elif result.get("status") in ["gender", "age"]:
+            # Нужно указать пол/возраст
+            await ask_user_info(update, context, result.get("status"))
+            return "blocked"
+        
+        else:
+            # Ошибка или другие статусы - пропускаем пользователя
+            return "passed"
+            
+    except Exception as e:
+        logger.error(f"Error checking SubGram subscriptions: {e}")
+        return "passed"  # В случае ошибки пропускаем пользователя
+
+async def show_subgram_sponsors(update: Update, context: ContextTypes.DEFAULT_TYPE, subgram_result):
+    """Показывает спонсоров для подписки"""
+    sponsors = subgram_result.get("additional", {}).get("sponsors", [])
+    
+    if not sponsors:
+        await send_message(update, context, "❌ Ошибка при получении списка каналов.")
+        return
+    
+    message_text = "📢 Для доступа к боту необходимо подписаться на следующие каналы:\n\n"
+    
+    keyboard = []
+    for sponsor in sponsors:
+        if sponsor.get("available_now", False) and sponsor.get("status") == "unsubscribed":
+            message_text += f"• {sponsor.get('resource_name', 'Канал')}\n"
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {sponsor.get('button_text', 'Подписаться')} - {sponsor.get('resource_name', 'Канал')}",
+                url=sponsor.get('link', '')
+            )])
+    
+    keyboard.append([InlineKeyboardButton("🔁 Проверить подписки", callback_data="check_subscriptions")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await send_message(update, context, message_text, reply_markup)
+
+async def show_subgram_registration(update: Update, context: ContextTypes.DEFAULT_TYPE, subgram_result):
+    """Показывает форму регистрации SubGram"""
+    registration_url = subgram_result.get("additional", {}).get("registration_url", "")
+    
+    if not registration_url:
+        await send_message(update, context, "❌ Ошибка при получении формы регистрации.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            "✅ Пройти быструю регистрацию",
+            web_app=WebAppInfo(url=registration_url)
+        )],
+        [InlineKeyboardButton("🔁 Проверить подписки", callback_data="check_subscriptions")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await send_message(update, context, 
+        "Для продолжения, пожалуйста, укажите ваш пол и возраст в форме регистрации.",
+        reply_markup
+    )
+
+async def ask_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE, info_type: str):
+    """Запрашивает у пользователя дополнительную информацию"""
+    if info_type == "gender":
+        keyboard = [
+            [InlineKeyboardButton("👨 Мужской", callback_data="set_gender_male")],
+            [InlineKeyboardButton("👩 Женский", callback_data="set_gender_female")],
+            [InlineKeyboardButton("🔁 Проверить подписки", callback_data="check_subscriptions")]
+        ]
+        message_text = "Пожалуйста, укажите ваш пол:"
+    else:  # age
+        keyboard = [
+            [InlineKeyboardButton("🔞 До 18", callback_data="set_age_17")],
+            [InlineKeyboardButton("👤 18-24", callback_data="set_age_21")],
+            [InlineKeyboardButton("👨 25-34", callback_data="set_age_30")],
+            [InlineKeyboardButton("👴 35+", callback_data="set_age_35")],
+            [InlineKeyboardButton("🔁 Проверить подписки", callback_data="check_subscriptions")]
+        ]
+        message_text = "Пожалуйста, укажите ваш возраст:"
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await send_message(update, context, message_text, reply_markup)
+
+async def handle_user_info_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор пола/возраста пользователем"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data.startswith("set_gender_"):
+        gender = data.split("_")[2]  # male или female
+        bot_manager.update_user_subgram_data(user_id, gender=gender)
+        await send_message(update, context, f"✅ Пол сохранен: {'Мужской' if gender == 'male' else 'Женский'}")
+        
+    elif data.startswith("set_age_"):
+        age_str = data.split("_")[2]
+        age_map = {"17": 17, "21": 21, "30": 30, "35": 35}
+        age = age_map.get(age_str, 25)
+        bot_manager.update_user_subgram_data(user_id, age=age)
+        await send_message(update, context, f"✅ Возраст сохранен: {age} лет")
+    
+    # После сохранения данных проверяем подписки снова
+    await check_subscriptions_callback(update, context)
+
+async def check_subscriptions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки проверки подписок"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    subgram_result = await check_subgram_subscriptions(update, context, user)
+    
+    if subgram_result == "passed":
+        await send_message(update, context, "✅ Отлично! Теперь у вас есть доступ к боту.")
+        await show_main_menu(update, context)
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buttons = bot_manager.get_child_buttons(0)  # Кнопки верхнего уровня
+    buttons = bot_manager.get_child_buttons(0)
     
     if not buttons:
         keyboard = [
@@ -287,11 +582,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for button in buttons:
         keyboard.append([InlineKeyboardButton(button.name, callback_data=f"button_{button.id}")])
     
-    # Добавляем кнопку баланса и реферальной системы
     keyboard.append([InlineKeyboardButton("💰 Баланс", callback_data="balance")])
     keyboard.append([InlineKeyboardButton("👥 Реферальная система", callback_data="referral")])
     
-    # Добавляем кнопку для админов
     user_id = update.effective_user.id
     if bot_manager.is_admin(user_id):
         keyboard.append([InlineKeyboardButton("⚙️ Админ панель", callback_data="admin_panel")])
@@ -313,7 +606,6 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_referral_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Генерируем реферальную ссылку
     bot_username = (await context.bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start={user_id}"
     
@@ -359,20 +651,22 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "referral":
         await show_referral_system(update, context)
     
+    elif data == "check_subscriptions":
+        await check_subscriptions_callback(update, context)
+    
+    elif data.startswith("set_gender_") or data.startswith("set_age_"):
+        await handle_user_info_selection(update, context)
+    
     elif data.startswith("start_task_"):
         button_id = int(data.split("_")[2])
         button = bot_manager.get_button(button_id)
         
         if button and button.price > 0:
-            # Проверяем, не выполнял ли пользователь уже это задание
             if bot_manager.has_completed_task(user_id, button_id):
                 await send_message(update, context, "❌ Вы уже выполняли это задание!")
                 return
             
-            # Добавляем задание в список выполненных (но еще не подтвержденных)
             bot_manager.add_completed_task(user_id, button_id)
-            
-            # Устанавливаем состояние ожидания скриншота
             context.user_data['awaiting_screenshot'] = True
             context.user_data['task_button_id'] = button_id
             
@@ -392,29 +686,24 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         button = bot_manager.get_button(button_id)
         
         if button:
-            # Если у кнопки есть фото и цена, показываем страницу задания
             if button.photo_url and button.price > 0:
                 await show_task_page(update, context, button)
                 return
             
-            # Парсим кнопки из JSON
             child_buttons_data = json.loads(button.buttons) if button.buttons else []
             child_buttons = bot_manager.get_child_buttons(button_id)
             
             keyboard = []
             
-            # Добавляем дочерние кнопки из базы данных
             for child_button in child_buttons:
                 keyboard.append([InlineKeyboardButton(child_button.name, callback_data=f"button_{child_button.id}")])
             
-            # Добавляем кнопки из JSON
             for btn_data in child_buttons_data:
                 if "url" in btn_data:
                     keyboard.append([InlineKeyboardButton(btn_data["name"], url=btn_data["url"])])
                 else:
                     keyboard.append([InlineKeyboardButton(btn_data["name"], callback_data=btn_data["callback_data"])])
             
-            # Добавляем кнопку назад
             if button.parent_id != 0:
                 keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"button_{button.parent_id}")])
             keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
@@ -423,6 +712,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_message(update, context, button.message_text, reply_markup)
     
     # Админские callback'ы
+    elif data == "subgram_management":
+        await subgram_management(update, context)
+    elif data == "subgram_register":
+        await subgram_register_bot(update, context)
+    elif data == "subgram_info":
+        await subgram_bot_info(update, context)
+    elif data == "subgram_settings":
+        await subgram_settings(update, context)
     elif data == "add_button":
         await admin_add_button(update, context)
     elif data == "list_buttons":
@@ -447,10 +744,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_parent_selection(update, context)
 
 async def show_task_page(update: Update, context: ContextTypes.DEFAULT_TYPE, button: Button):
-    """Показывает страницу задания с фото, ценой и кнопкой для начала задания"""
     user_id = update.effective_user.id
-    
-    # Проверяем, выполнял ли пользователь уже это задание
     has_completed = bot_manager.has_completed_task(user_id, button.id)
     
     message_text = f"{button.message_text}\n\n💰 Стоимость: {button.price:.2f} руб."
@@ -458,28 +752,23 @@ async def show_task_page(update: Update, context: ContextTypes.DEFAULT_TYPE, but
     if has_completed:
         message_text += "\n\n✅ Вы уже выполнили это задание"
     
-    # Парсим кнопки из JSON
     child_buttons_data = json.loads(button.buttons) if button.buttons else []
     
     keyboard = []
     
-    # Добавляем кнопку для начала задания только если пользователь еще не выполнял его
     if not has_completed:
         keyboard.append([InlineKeyboardButton("🎯 Начать задание", callback_data=f"start_task_{button.id}")])
     
-    # Добавляем кнопки из JSON (ссылки)
     for btn_data in child_buttons_data:
         if "url" in btn_data:
             keyboard.append([InlineKeyboardButton(btn_data["name"], url=btn_data["url"])])
     
-    # Добавляем навигационные кнопки
     if button.parent_id != 0:
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"button_{button.parent_id}")])
     keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отправляем фото с текстом и кнопками
     try:
         if update.callback_query:
             if button.photo_url:
@@ -507,11 +796,9 @@ async def show_task_page(update: Update, context: ContextTypes.DEFAULT_TYPE, but
                 )
     except Exception as e:
         logger.error(f"Error sending task page: {e}")
-        # Если не удалось отправить фото, отправляем просто текст
         await send_message(update, context, message_text, reply_markup)
 
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка скриншотов от пользователей"""
     user_id = update.effective_user.id
     
     if context.user_data.get('awaiting_screenshot') and (update.message.photo or update.message.document):
@@ -519,26 +806,20 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         button = bot_manager.get_button(button_id)
         
         if button:
-            # Отмечаем, что скриншот отправлен
             bot_manager.set_task_screenshot_sent(user_id, button_id)
-            
-            # Очищаем состояние
             context.user_data.pop('awaiting_screenshot', None)
             context.user_data.pop('task_button_id', None)
             
-            # Уведомляем пользователя
             await update.message.reply_text(
                 "✅ Скриншот отправлен на проверку администратору!\n"
                 "Мы проверим его в ближайшее время и начислим деньги на ваш баланс."
             )
             
-            # Уведомляем администраторов
             admins = bot_manager.session.query(Admin).all()
             admin_ids = [admin.user_id for admin in admins] + ADMIN_IDS
             
             for admin_id in admin_ids:
                 try:
-                    # Пересылаем сообщение со скриншотом администратору
                     if update.message.photo:
                         await context.bot.send_photo(
                             chat_id=admin_id,
@@ -565,7 +846,6 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error notifying admin {admin_id}: {e}")
 
 async def approve_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для подтверждения задания администратором"""
     user_id = update.effective_user.id
     
     if not bot_manager.is_admin(user_id):
@@ -585,16 +865,12 @@ async def approve_task_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ Задание не найдено.")
             return
         
-        # Подтверждаем задание
         if bot_manager.approve_task(target_user_id, button_id):
-            # Начисляем бонус рефереру если это первое задание
             referrer_id = bot_manager.get_referrer(target_user_id)
             if referrer_id and bot_manager.mark_first_task_completed(target_user_id):
-                # Начисляем 10% от заработка приглашенного
                 bonus_amount = button.price * REFERRER_BONUS_PERCENT
                 bot_manager.update_user_balance(referrer_id, bonus_amount)
                 
-                # Уведомляем реферера
                 try:
                     await context.bot.send_message(
                         chat_id=referrer_id,
@@ -608,7 +884,6 @@ async def approve_task_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"Пользователь {target_user_id} получил {button.price:.2f} руб."
             )
             
-            # Уведомляем пользователя
             try:
                 await context.bot.send_message(
                     chat_id=target_user_id,
@@ -623,7 +898,6 @@ async def approve_task_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Неверный формат аргументов.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /help - открывает чат с администратором"""
     keyboard = [
         [InlineKeyboardButton("📞 Написать администратору", url="https://t.me/MoneyMovesAdmin1")]
     ]
@@ -635,9 +909,128 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /balance - показывает баланс"""
     await show_balance(update, context)
 
+# SubGram функции админ-панели
+async def subgram_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if bot_manager.get_admin_permissions(user_id) != "all":
+        await send_message(update, context, "❌ У вас нет прав для управления SubGram.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Зарегистрировать бота в SubGram", callback_data="subgram_register")],
+        [InlineKeyboardButton("ℹ️ Информация о боте", callback_data="subgram_info")],
+        [InlineKeyboardButton("⚙️ Настройки SubGram", callback_data="subgram_settings")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await send_message(update, context, "🎯 Управление SubGram интеграцией", reply_markup)
+
+async def subgram_register_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if bot_manager.get_admin_permissions(user_id) != "all":
+        await send_message(update, context, "❌ У вас нет прав для управления SubGram.")
+        return
+    
+    try:
+        result = subgram_manager.add_bot(
+            bot_token=BOT_TOKEN,
+            max_sponsors=4,
+            time_purge=180,
+            text_op="Подпишитесь на каналы ниже чтобы получить доступ к контенту!",
+            forbidden_themes=["adult", "crypto"]
+        )
+        
+        if result.get("status") == "ok":
+            global SUBGRAM_BOT_API_KEY
+            SUBGRAM_BOT_API_KEY = result["result"]["api_key"]
+            message = f"""
+✅ Бот успешно зарегистрирован в SubGram!
+
+🔑 API Key: `{SUBGRAM_BOT_API_KEY}`
+
+Теперь вы можете использовать проверку подписок в своем боте.
+"""
+        else:
+            message = f"❌ Ошибка регистрации: {result.get('message', 'Неизвестная ошибка')}"
+            
+    except Exception as e:
+        message = f"❌ Ошибка при регистрации: {str(e)}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="subgram_management")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await send_message(update, context, message, reply_markup)
+
+async def subgram_bot_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if bot_manager.get_admin_permissions(user_id) != "all":
+        await send_message(update, context, "❌ У вас нет прав для управления SubGram.")
+        return
+    
+    if not SUBGRAM_BOT_API_KEY:
+        await send_message(update, context, "❌ Бот не зарегистрирован в SubGram.")
+        return
+    
+    try:
+        bot_id = int(BOT_TOKEN.split(':')[0])
+        bot_info = subgram_manager.get_bot_info(bot_id)
+        
+        if bot_info.get("status") == "ok":
+            result = bot_info["result"]
+            message = f"""
+📊 Информация о боте в SubGram:
+
+🆔 ID: {result['bot_id']}
+📛 Имя: {result['bot_name']}
+👤 Юзернейм: @{result['bot_nickname']}
+📊 Прибыль: {result['profit']} руб.
+🔧 Статус: {'Включен' if result['is_on'] else 'Выключен'}
+"""
+        else:
+            message = f"❌ Ошибка получения информации: {bot_info.get('message')}"
+            
+    except Exception as e:
+        message = f"❌ Ошибка: {str(e)}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="subgram_management")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await send_message(update, context, message, reply_markup)
+
+async def subgram_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if bot_manager.get_admin_permissions(user_id) != "all":
+        await send_message(update, context, "❌ У вас нет прав для управления SubGram.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🔧 Обновить настройки", callback_data="subgram_update_settings")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="subgram_management")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await send_message(update, context, 
+        "⚙️ Настройки SubGram:\n\n"
+        "Здесь вы можете изменить настройки интеграции с SubGram.",
+        reply_markup
+    )
+
+# Остальные функции админ-панели (оставлены без изменений)
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     permissions = bot_manager.get_admin_permissions(user_id)
@@ -646,9 +1039,9 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Добавить кнопку", callback_data="add_button")],
         [InlineKeyboardButton("📋 Список кнопок", callback_data="list_buttons")],
         [InlineKeyboardButton("🗑️ Удалить кнопку", callback_data="delete_button")],
+        [InlineKeyboardButton("🎯 Управление SubGram", callback_data="subgram_management")],
     ]
     
-    # Только админы с полными правами могут управлять другими админами и делать рассылку
     if permissions == "all":
         keyboard.extend([
             [InlineKeyboardButton("📢 Рассылка", callback_data="broadcast")],
@@ -936,12 +1329,10 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.message.reply_text("❌ Неверный уровень прав. Используйте 'all' или 'limited'.")
                 return
             
-            # Нельзя изменять права главных администраторов
             if admin_id in ADMIN_IDS:
                 await update.message.reply_text("❌ Нельзя изменять права главных администраторов.")
                 return
             
-            # Обновляем права
             if bot_manager.update_admin_permissions(admin_id, permissions):
                 context.user_data.pop('awaiting_admin_id_for_perms', None)
                 context.user_data.pop('admin_action', None)
@@ -959,7 +1350,6 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop('awaiting_broadcast', None)
         context.user_data.pop('admin_action', None)
         
-        # Получаем всех пользователей
         users = bot_manager.get_all_users()
         sent_count = 0
         failed_count = 0
@@ -990,7 +1380,6 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['awaiting_button_name'] = False
         context.user_data['awaiting_parent_id'] = True
         
-        # Показываем список существующих кнопок для выбора родителя
         buttons = bot_manager.get_all_buttons()
         keyboard = [[InlineKeyboardButton("🏠 Корневой уровень", callback_data="parent_0")]]
         
@@ -1043,14 +1432,12 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             buttons_json = "[]"
         else:
             try:
-                # Валидируем JSON
                 buttons_data = json.loads(text)
                 buttons_json = text
             except json.JSONDecodeError:
                 await update.message.reply_text("Ошибка в формате JSON. Попробуйте еще раз:")
                 return
         
-        # Создаем кнопку в базе данных
         button_id = bot_manager.create_button(
             name=context.user_data['button_name'],
             parent_id=context.user_data['parent_id'],
@@ -1060,14 +1447,12 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             price=context.user_data.get('price', 0.0)
         )
         
-        # Очищаем временные данные
         for key in ['button_name', 'parent_id', 'message_text', 'photo_url', 'price', 'awaiting_buttons_json', 'admin_action']:
             context.user_data.pop(key, None)
         
         await update.message.reply_text(f"✅ Кнопка '{context.user_data.get('button_name', '')}' успешно создана! ID: {button_id}")
 
 async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
-    """Универсальная функция отправки сообщений"""
     try:
         if update.callback_query:
             await update.callback_query.edit_message_text(
@@ -1097,15 +1482,12 @@ async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка обычных сообщений"""
     user_id = update.effective_user.id
     
-    # Если пользователь не админ и не в процессе диалога с админ-панелью
     if not bot_manager.is_admin(user_id) and not context.user_data.get('admin_action'):
         await show_main_menu(update, context)
 
 def main():
-    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Обработчики команд
